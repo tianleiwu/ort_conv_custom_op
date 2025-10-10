@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 import onnx
 import onnxruntime as ort
 import subprocess
@@ -7,7 +6,6 @@ import os
 import platform
 import sys
 import triton
-import re
 import glob
 from collections import OrderedDict
 
@@ -113,11 +111,24 @@ def aot_compile_and_prepare_kernel():
         # Process C Source File
         with open(hashed_c_file_path, 'r') as f:
             content = f.read()
+
         content = content.replace(symbol_safe_hashed_name, final_output_name)
+        
+        # Find where the declarations start (after the #endif of the include guard)
+        include_guard_end = "#include <cuda.h>"
+        pos = content.find(include_guard_end)
+        if pos != -1:
+            insertion_point = pos + len(include_guard_end)
+            declarations = content[insertion_point:]
+            declarations = declarations.lstrip('\n')
+            # Reconstruct content with guards around the declarations
+            content = content[:insertion_point] + c_guard_start + declarations + c_guard_end
+
+        content = content.replace("if(gX * gY * gZ > 0)", "")
         # Wrap the entire content of the C file in the guards
-        final_cpp_content = c_guard_start + content + c_guard_end
+        # final_cpp_content = c_guard_start + content + c_guard_end
         with open(final_c_path, 'w') as f:
-            f.write(final_cpp_content)
+            f.write(content)
         os.remove(hashed_c_file_path)
 
         print(f"✅ Triton kernel AOT compiled and cleaned successfully.")

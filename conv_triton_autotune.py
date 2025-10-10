@@ -3,6 +3,16 @@
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE': 64}),
+        triton.Config({'BLOCK_SIZE': 128}),
+        triton.Config({'BLOCK_SIZE': 256}),
+        triton.Config({'BLOCK_SIZE': 512}),
+        triton.Config({'BLOCK_SIZE': 1024}),
+    ],
+    key=['KH', 'KW'],
+)
 @triton.jit
 def conv_kernel_triton(
     # Pointers to Tensors

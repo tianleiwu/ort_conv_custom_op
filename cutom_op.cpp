@@ -1,12 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-// These defines are required to use the lite custom op API and manage the API
-// object manually.
 #include "onnxruntime_cxx_api.h"
-
 #include "core/providers/cuda/cuda_context.h"
-#include "onnxruntime_lite_custom_op.h" // The modern, simplified custom op API header
+#include "onnxruntime_lite_custom_op.h"
 
 #include <cuda_fp16.h>
 #include <iostream>
@@ -41,14 +38,11 @@ struct TritonConvKernel {
   // framework to determine the operator's inputs and outputs. This is much
   // safer than manual indexing.
   void Compute(const CudaContext &cuda_ctx,
-               const Tensor<half> &Y, // 1st Input
-               const Tensor<half> &W, // 2nd Input
-               const Tensor<half> &B, // 3rd Input
-               Tensor<half> &Z) {     // 1st Output (mutable)
+               const Tensor<Ort::Float16_t> &Y, // 1st Input
+               const Tensor<Ort::Float16_t> &W, // 2nd Input
+               const Tensor<Ort::Float16_t> &B, // 3rd Input
+               Tensor<Ort::Float16_t> &Z) {     // 1st Output (mutable)
 
-    // Lazy, thread-safe loading of the Triton CUDA module.
-    // This is called only on the first execution, at which point ONNX Runtime
-    // guarantees that a valid CUDA context is active.
     std::call_once(triton_module_loaded_flag, []() {
       std::cout
           << "[INFO] TritonConvKernel: First execution, loading CUDA module."
@@ -60,9 +54,10 @@ struct TritonConvKernel {
     const auto &Y_shape = Y.Shape();
     const auto &W_shape = W.Shape();
 
-    const half *Y_ptr = Y.Data();
-    const half *W_ptr = W.Data();
-    const half *B_ptr = B.Data();
+    // --- FIX: Cast the data pointers to the type the kernel expects ---
+    const half *Y_ptr = reinterpret_cast<const half *>(Y.Data());
+    const half *W_ptr = reinterpret_cast<const half *>(W.Data());
+    const half *B_ptr = reinterpret_cast<const half *>(B.Data());
 
     // Calculate output shape.
     const int64_t N = Y_shape[0];
@@ -77,8 +72,8 @@ struct TritonConvKernel {
     std::vector<int64_t> Z_shape = {N, C_out, H_out};
 
     // Allocate the output tensor's memory and get a mutable pointer to it.
-    half *Z_ptr = Z.Allocate(Z_shape);
-
+    half *Z_ptr = reinterpret_cast<half *>(Z.Allocate(Z_shape));
+    
     // Calculate strides.
     int64_t stride_in_c = H_in * W_in;
     int64_t stride_in_h = W_in;
@@ -98,7 +93,7 @@ struct TritonConvKernel {
                        stride_in_h, stride_in_w, stride_w_cout, stride_out_cout,
                        stride_out_h, (int32_t)pad_h_, (int32_t)groups_);
   }
-
+  
 private:
   int64_t pad_h_;
   int64_t groups_;

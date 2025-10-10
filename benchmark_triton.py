@@ -1,8 +1,7 @@
 # File: benchmark_triton.py
 
 import torch
-import time
-from conv_triton import conv_kernel_triton
+from conv_triton_autotune import conv_kernel_triton
 
 def benchmark(seq_len: int, precision: str, warmup: int = 20, runs: int = 100):
     """

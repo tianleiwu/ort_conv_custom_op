@@ -2,15 +2,22 @@ cmake_minimum_required(VERSION 3.18)
 project(TritonCustomOp LANGUAGES CXX C) # Enable both C and CXX compilers
 
 # --- Find Dependencies ---
+find_library(CUDA_DRIVER_LIBRARY cuda
+    HINTS $ENV{CUDA_HOME}/targets/x86_64-linux/lib/stubs /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib/wsl/lib
+)
+if (NOT CUDA_DRIVER_LIBRARY)
+    message(WARNING "libcuda.so not found — you may need to install or symlink it manually.")
+endif()
+
 
 find_package(CUDA REQUIRED)
 message(STATUS "Found CUDA includes: ${CUDA_INCLUDE_DIRS}")
 
-set(CUDNN_PATH /home/tlwu/cudnn9.12)
+set(CUDNN_PATH "/home/tlwu/cudnn9.14_cuda12")
 
 find_path(
     CUDNN_INCLUDE_DIR cudnn.h
-    HINTS $ENV{CUDNN_PATH} ${CUDNN_PATH}
+    HINTS $ENV{CUDNN_HOME}
     PATH_SUFFIXES include
     REQUIRED
 )
@@ -27,7 +34,7 @@ add_library(triton_conv_op SHARED)
 
 # Add preprocessor definition needed for the InitApi() function in the C++ code
 target_compile_definitions(triton_conv_op PRIVATE ORT_API_MANUAL_INIT)
-target_compile_definitions(triton_conv_op PRIVATE ORT_CUDA_CTX)
+# target_compile_definitions(triton_conv_op PRIVATE ORT_CUDA_CTX)
 
 # Add all necessary include directories.
 
@@ -55,7 +62,7 @@ set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/triton_conv_kernel.cpp
 
 target_link_libraries(triton_conv_op PRIVATE
     onnxruntime
-    cuda # For the CUDA Driver API (cuModuleLoadData, etc.)
+    ${CUDA_DRIVER_LIBRARY} # For the CUDA Driver API (cuModuleLoadData, etc.)
 )
 
 # Set C++ standard for C++ files in the target
