@@ -1,43 +1,70 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+// These defines are required to use the lite custom op API and manage the API
+// object manually.
+#include "onnxruntime_cxx_api.h"
+
+#include "core/providers/cuda/cuda_context.h"
+#include "onnxruntime_lite_custom_op.h" // The modern, simplified custom op API header
+
 #include <cuda_fp16.h>
-#include <onnxruntime_cxx_api.h>
+#include <iostream>
+#include <memory>
+#include <mutex>
 #include <vector>
 
-// --- THE FIX: Wrap the Triton header in extern "C" ---
-// This tells the C++ compiler to use C-style linkage for the Triton
-// functions, preventing name mangling and resolving the "undefined symbol"
-// error.
+// Include the Triton kernel header within an extern "C" block to prevent C++
+// name mangling.
 extern "C" {
 #include "triton_conv_kernel.h"
 }
 
-// Define a struct to hold kernel parameters and logic
+// Use the namespaces from the lite custom op header for cleaner code.
+using namespace Ort::Custom;
+
+// Global flag to ensure the CUDA module is loaded only once across all threads
+// and instances.
+static std::once_flag triton_module_loaded_flag;
+
+// The TritonConvKernel struct now acts as a "functor" for the custom op.
+// Its `Compute` method contains the kernel logic.
 struct TritonConvKernel {
-  TritonConvKernel(const OrtKernelInfo *info) {
-    // Use ConstKernelInfo for safe, read-only access to attributes
+  TritonConvKernel(const OrtApi *&, const OrtKernelInfo *info) {
+    // The constructor's only job is to read attributes from the ONNX node.
     Ort::ConstKernelInfo kernel_info(info);
-    pad_h = kernel_info.GetAttribute<int64_t>("pad_h");
-    groups = kernel_info.GetAttribute<int64_t>("groups");
+    pad_h_ = kernel_info.GetAttribute<int64_t>("pad_h");
+    groups_ = kernel_info.GetAttribute<int64_t>("groups");
   }
 
-  void Compute(OrtKernelContext *context) {
-    Ort::KernelContext ctx(context);
+  // The signature of the Compute method is automatically parsed by the lite op
+  // framework to determine the operator's inputs and outputs. This is much
+  // safer than manual indexing.
+  void Compute(const CudaContext &cuda_ctx,
+               const Tensor<half> &Y, // 1st Input
+               const Tensor<half> &W, // 2nd Input
+               const Tensor<half> &B, // 3rd Input
+               Tensor<half> &Z) {     // 1st Output (mutable)
 
-    // Get Input Tensors using the ConstValue wrapper
-    Ort::ConstValue Y_ort = ctx.GetInput(0);
-    Ort::ConstValue W_ort = ctx.GetInput(1);
-    Ort::ConstValue B_ort = ctx.GetInput(2);
+    // Lazy, thread-safe loading of the Triton CUDA module.
+    // This is called only on the first execution, at which point ONNX Runtime
+    // guarantees that a valid CUDA context is active.
+    std::call_once(triton_module_loaded_flag, []() {
+      std::cout
+          << "[INFO] TritonConvKernel: First execution, loading CUDA module."
+          << std::endl;
+      load_triton_conv_kernel();
+    });
 
-    // Get Input Shapes and Data Pointers
-    auto Y_shape_info = Y_ort.GetTensorTypeAndShapeInfo();
-    auto W_shape_info = W_ort.GetTensorTypeAndShapeInfo();
-    auto Y_shape = Y_shape_info.GetShape();
-    auto W_shape = W_shape_info.GetShape();
+    // Get shapes and data pointers from the strongly-typed Tensor objects.
+    const auto &Y_shape = Y.Shape();
+    const auto &W_shape = W.Shape();
 
-    const half *Y_ptr = Y_ort.GetTensorData<half>();
-    const half *W_ptr = W_ort.GetTensorData<half>();
-    const half *B_ptr = B_ort.GetTensorData<half>();
+    const half *Y_ptr = Y.Data();
+    const half *W_ptr = W.Data();
+    const half *B_ptr = B.Data();
 
-    // Prepare Output Tensor
+    // Calculate output shape.
     const int64_t N = Y_shape[0];
     const int64_t C_in = Y_shape[1];
     const int64_t H_in = Y_shape[2];
@@ -45,64 +72,82 @@ struct TritonConvKernel {
     const int64_t C_out = W_shape[0];
     const int64_t KH = W_shape[2];
     const int64_t KW = W_shape[3];
-    const int64_t H_out = H_in - KH + 1 + (2 * pad_h);
+    const int64_t H_out = H_in - KH + 1 + (2 * pad_h_);
 
     std::vector<int64_t> Z_shape = {N, C_out, H_out};
 
-    Ort::UnownedValue Z_ort_unowned = ctx.GetOutput(0, Z_shape);
-    half *Z_ptr = Z_ort_unowned.GetTensorMutableData<half>();
+    // Allocate the output tensor's memory and get a mutable pointer to it.
+    half *Z_ptr = Z.Allocate(Z_shape);
 
-    // Calculate Strides
+    // Calculate strides.
     int64_t stride_in_c = H_in * W_in;
     int64_t stride_in_h = W_in;
     int64_t stride_in_w = 1;
-    int64_t stride_w_cout = (C_in / groups) * KH * KW;
+    int64_t stride_w_cout = (C_in / groups_) * KH * KW;
     int64_t stride_out_cout = H_out;
     int64_t stride_out_h = 1;
 
-    // Launch the CUDA Kernel
-    CUstream stream = (CUstream)ctx.GetGPUComputeStream();
+    // Get the CUDA stream from the context object provided by the framework.
+    CUstream stream = cuda_ctx.cuda_stream;
+
+    // Launch the Triton kernel.
     triton_conv_kernel(stream, (CUdeviceptr)Y_ptr, (CUdeviceptr)W_ptr,
                        (CUdeviceptr)B_ptr, (CUdeviceptr)Z_ptr, (int32_t)H_in,
                        (int32_t)W_in, (int32_t)C_in, (int32_t)H_out,
                        (int32_t)C_out, (int32_t)KH, (int32_t)KW, stride_in_c,
                        stride_in_h, stride_in_w, stride_w_cout, stride_out_cout,
-                       stride_out_h, (int32_t)pad_h, (int32_t)groups);
+                       stride_out_h, (int32_t)pad_h_, (int32_t)groups_);
   }
 
 private:
-  int64_t pad_h;
-  int64_t groups;
+  int64_t pad_h_;
+  int64_t groups_;
 };
 
-// Custom Operator Definition
-struct TritonConvOp : Ort::CustomOpBase<TritonConvOp, TritonConvKernel> {
-  void *CreateKernel(const OrtApi &api, const OrtKernelInfo *info) const {
-    return new TritonConvKernel(info);
-  };
-  const char *GetName() const { return "TritonConv"; };
-  const char *GetExecutionProviderType() const {
-    return "CUDAExecutionProvider";
-  };
+// --- New Registration Logic (following the provided example) ---
 
-  size_t GetInputTypeCount() const { return 3; };
-  ONNXTensorElementDataType GetInputType(size_t index) const {
-    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
-  };
+static const char *c_OpDomain = "com.custom.ops";
 
-  size_t GetOutputTypeCount() const { return 1; };
-  ONNXTensorElementDataType GetOutputType(size_t index) const {
-    return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
-  };
-};
+// This function registers all CUDA custom ops for a given domain.
+void RegisterCudaOps(Ort::CustomOpDomain &domain) {
+  // A static unique_ptr ensures the operator definition has a permanent
+  // lifetime after it's created on the first call.
+  static const auto triton_conv_op =
+      Ort::Custom::CreateLiteCustomOp<TritonConvKernel>(
+          "TritonConv", "CUDAExecutionProvider");
+  domain.Add(triton_conv_op);
+}
 
-// Registration Logic
-static Ort::CustomOpDomain custom_op_domain("com.custom.ops");
-static TritonConvOp triton_conv_op;
+// This container and mutex are used to manage the lifetime of the
+// CustomOpDomain object, preventing it from being destroyed while the ONNX
+// Runtime session is still active.
+static void AddOrtCustomOpDomainToContainer(Ort::CustomOpDomain &&domain) {
+  static std::vector<Ort::CustomOpDomain> ort_custom_op_domain_container;
+  static std::mutex ort_custom_op_domain_mutex;
+  std::lock_guard<std::mutex> lock(ort_custom_op_domain_mutex);
+  ort_custom_op_domain_container.push_back(std::move(domain));
+}
 
+// This is the main C-style entry point that ONNX Runtime will call to register
+// the operators.
 extern "C" OrtStatus *ORT_API_CALL
 RegisterCustomOps(OrtSessionOptions *options, const OrtApiBase *api_base) {
   Ort::InitApi(api_base->GetApi(ORT_API_VERSION));
-  custom_op_domain.Add(&triton_conv_op);
-  return Ort::GetApi().AddCustomOpDomain(options, custom_op_domain);
+  OrtStatus *result = nullptr;
+
+  // The ORT_TRY/ORT_CATCH block provides exception safety.
+  try {
+    Ort::CustomOpDomain domain{c_OpDomain};
+    RegisterCudaOps(domain);
+
+    Ort::UnownedSessionOptions session_options(options);
+    session_options.Add(domain);
+
+    // Move the domain to the static container to ensure it stays alive.
+    AddOrtCustomOpDomainToContainer(std::move(domain));
+  } catch (const std::exception &e) {
+    printf("Exception during custom op registration: %s\n", e.what());
+  }
+
+  return result;
 }

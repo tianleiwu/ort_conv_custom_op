@@ -12,18 +12,21 @@ import glob
 from collections import OrderedDict
 
 # --- Define Project Root ---
+# This makes the script runnable from anywhere
 PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # --- Define path to your downloaded ONNX Runtime ---
+# This should be the path to the extracted directory, e.g., 'onnxruntime-linux-x64-gpu-1.23.0'
 ORT_CUSTOM_PATH = os.path.join(PROJ_ROOT, "vendor", "onnxruntime-linux-x64-gpu-1.23.0")
-# -------------------------
+
 
 def aot_compile_and_prepare_kernel():
     """
     Compiles the Triton kernel, finds the hashed output files, renames them,
-    and replaces the hashed function names inside the files with clean names.
+    and wraps both header and source in extern "C" to prevent C++ name mangling.
     """
     print("\n[Step 1] Compiling Triton kernel (AOT)...")
+
     kernel_file = os.path.join(PROJ_ROOT, "conv_triton.py")
     if not os.path.exists(kernel_file):
         print(f"❌ Error: Kernel file '{kernel_file}' not found.")
@@ -57,7 +60,8 @@ def aot_compile_and_prepare_kernel():
                 "--num-warps", "4",
                 "--grid", "C_out, H_out, 1"
             ],
-            check=True, capture_output=True, text=True, cwd=build_dir
+            check=True, capture_output=True, text=True,
+            cwd=build_dir
         )
     except subprocess.CalledProcessError as e:
         print("❌ Triton AOT compilation failed.")
@@ -75,23 +79,46 @@ def aot_compile_and_prepare_kernel():
         hashed_c_file_path = hashed_c_files[0]
         base_path, _ = os.path.splitext(hashed_c_file_path)
         hashed_h_file_path = base_path + ".h"
+        
         hashed_function_name = os.path.splitext(os.path.basename(hashed_c_file_path))[0]
+        symbol_safe_hashed_name = hashed_function_name.replace('.', '_')
         
         print(f"   - Detected hashed function name: {hashed_function_name}")
-        print(f"   - Renaming to: {final_output_name}")
-        
+        print(f"   - Renaming symbol '{symbol_safe_hashed_name}' to '{final_output_name}'")
+
         final_h_path = os.path.join(build_dir, f"{final_output_name}.h")
         final_c_path = os.path.join(build_dir, f"{final_output_name}.cpp")
 
-        for path in [hashed_h_file_path, hashed_c_file_path]:
-            with open(path, 'r') as f:
-                content = f.read()
-            # The replace logic needs to handle potential '.' in the hash
-            content = content.replace(hashed_function_name.replace(".", "_"), final_output_name)
-            new_path = final_h_path if path.endswith(".h") else final_c_path
-            with open(new_path, 'w') as f:
-                f.write(content)
-            os.remove(path)
+        # C-style linkage guards for C++ compatibility
+        c_guard_start = "\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+        c_guard_end = "\n#ifdef __cplusplus\n}\n#endif\n"
+
+        # Process Header File
+        with open(hashed_h_file_path, 'r') as f:
+            content = f.read()
+        content = content.replace(symbol_safe_hashed_name, final_output_name)
+        # Find where the declarations start (after the #endif of the include guard)
+        include_guard_end = "#endif"
+        pos = content.find(include_guard_end)
+        if pos != -1:
+            insertion_point = pos + len(include_guard_end)
+            declarations = content[insertion_point:]
+            declarations = declarations.lstrip('\n')
+            # Reconstruct content with guards around the declarations
+            content = content[:insertion_point] + c_guard_start + declarations + c_guard_end
+        with open(final_h_path, 'w') as f:
+            f.write(content)
+        os.remove(hashed_h_file_path)
+
+        # Process C Source File
+        with open(hashed_c_file_path, 'r') as f:
+            content = f.read()
+        content = content.replace(symbol_safe_hashed_name, final_output_name)
+        # Wrap the entire content of the C file in the guards
+        final_cpp_content = c_guard_start + content + c_guard_end
+        with open(final_c_path, 'w') as f:
+            f.write(final_cpp_content)
+        os.remove(hashed_c_file_path)
 
         print(f"✅ Triton kernel AOT compiled and cleaned successfully.")
         return True
@@ -110,7 +137,12 @@ def build_custom_op():
     ort_root = ORT_CUSTOM_PATH
     print(f"   - Using ONNX Runtime from: {ort_root}")
 
-    cmake_args = ["cmake", "-S", PROJ_ROOT, "-B", build_dir, f"-DONNXRUNTIME_ROOT_DIR={ort_root}"]
+    cmake_args = [
+        "cmake",
+        "-S", PROJ_ROOT,
+        "-B", build_dir,
+        f"-DONNXRUNTIME_ROOT_DIR={ort_root}"
+    ]
     try:
         print(f"   - Running CMake command: {' '.join(cmake_args)}")
         subprocess.run(cmake_args, check=True, capture_output=True, text=True)
@@ -126,7 +158,6 @@ def build_custom_op():
         return False
     print("✅ Custom operator built successfully!")
     return True
-
 
 def create_onnx_model():
     """Creates an ONNX model that uses the TritonConv custom op."""
