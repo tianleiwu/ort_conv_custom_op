@@ -291,9 +291,12 @@ def main():
         return
 
     # Find the compiled custom op library
-    lib_name = "libtriton_conv_op.so"
-    if platform.system() == "Windows": lib_name = "triton_conv_op.dll"
-    elif platform.system() == "Darwin": lib_name = "libtriton_conv_op.dylib"
+    if platform.system() == "Windows":
+        lib_name = "triton_conv_op.dll"
+    elif platform.system() == "Darwin":
+        lib_name = "libtriton_conv_op.dylib"
+    else:
+        lib_name = "libtriton_conv_op.so"
     
     custom_op_lib_path = os.path.join(PROJ_ROOT, "build", lib_name)
     if not os.path.exists(custom_op_lib_path):
